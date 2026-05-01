@@ -9,6 +9,7 @@ channels, run one bot process per ``KICK_CHANNEL`` instead.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import os
 from pathlib import Path
@@ -25,6 +26,12 @@ from dotenv import load_dotenv
 from agent import AgentCooldown, run_agent, set_comment_meme_samples
 
 logger = logging.getLogger(__name__)
+
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
 
 URL_PATTERN = re.compile(r"https?://\S+|www\.\S+|\S+\.\S+/\S+", re.IGNORECASE)
 CHAT_MESSAGE_MAX_BYTES = 380
@@ -125,6 +132,9 @@ timed_tasks: list[asyncio.Task[None]] = []
 timers_started = False
 comment_messages: list[str] = []
 comment_prompt_samples: list[str] = []
+# Cache de mensagens enviadas pelo bot para evitar loop quando chat_poster_type=user
+# (o Pusher reenvia a mensagem com username do broadcaster, não do bot)
+_recent_bot_messages: deque[str] = deque(maxlen=30)
 
 
 class ChannelSession(NamedTuple):
@@ -383,6 +393,7 @@ def _load_comment_corpus() -> tuple[list[str], list[str]]:
 async def _safe_say(
     message: str, reply_to: str | None = None, broadcaster_id: int | None = None
 ) -> None:
+    global _recent_bot_messages
     try:
         fitted = _fit_chat_message(message)
         if not fitted:
@@ -394,6 +405,8 @@ async def _safe_say(
                 return
         else:
             target_bid = int(target_bid or 0)
+        # Registra no cache ANTES de enviar, pra detectar loop próprio
+        _recent_bot_messages.append(fitted.lower().strip())
         await app.api.send_message(
             broadcaster_id=target_bid,
             content=fitted,
@@ -529,8 +542,6 @@ def _ensure_timers_started() -> None:
                 if not comment_messages:
                     continue
                 message = random.choice(comment_messages)
-                if bot_username:
-                    message = f"{bot_username} {message}"
                 await _safe_say(message)
         except asyncio.CancelledError:
             return
@@ -562,6 +573,12 @@ async def on_chat(event: Any) -> None:
     channel_bid = getattr(event, "broadcaster_user_id", None)
 
     if not msg or _is_self_message(username):
+        return
+
+    # Ignora mensagens que o próprio bot acabou de enviar
+    # (chat_poster_type=user faz o Pusher reenviar como broadcaster, não como bot)
+    if _recent_bot_messages and msg.lower().strip() in _recent_bot_messages:
+        logger.debug("Ignoring own message (recent bot cache): %s", msg[:60])
         return
 
     if moderation_cfg.get("enabled", True) and await _handle_moderation(

@@ -14,46 +14,39 @@ from openai import APIError, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SYSTEM = """You are a Kick chat assistant for League of Legends streams.
-
-Your personality:
-- You act like a Brazilian stream viewer: funny, ironic, slightly sarcastic, and very familiar with League of Legends culture.
-- Your humor targets gameplay situations (bad plays, ranked struggles, macro mistakes, tilt), not personal attacks.
-
-Tone:
-- Witty and humorous, not chaotic or aggressive.
-- Use light exaggeration for comedic effect.
-
-Humor rules:
-- NEVER joke about real-world personal traits (appearance, body, etc.).
-- ALWAYS focus jokes on gameplay, decisions, or ranked experience.
-
-If a message includes insults or toxic language:
-- Do NOT repeat or reinforce the insult.
-- Redirect the humor toward the gameplay situation instead.
-
-Keep answers short (1-3 sentences) so they fit in chat.
-Always reply in Brazilian Portuguese.
-You know League of Legends deeply: champions, matchups, runes, items, macro, wave control, jungle tempo, objectives, drafts, and solo queue habits.
-Interpret chat slang, abbreviations, typos, and lightly censored profanity before responding.
-If a message is toxic or inappropriate, de-escalate and redirect to constructive League talk.
-
-Emotional behavior (use the [Tool: sentiment] block in the user message):
-- Negative: acknowledge frustration briefly, then joke about the game situation.
-- Positive / high energy: match hype with playful humor.
-- Neutral: default to light ironic commentary.
-
-Identity / meta: When asked if you are a bot, AI, who created you, or what you do, answer briefly and honestly
-using ONLY the facts under [Bot identity]. Say openly that you are an automated assistant; never pretend to be human
-or invent creators not listed there.
-
-Do not start replies with your own name, nickname, or intros like "Eu sou X" / "X aqui:" / "X diz:" — the chat already shows who is speaking; go straight to the answer.
-
-Catchphrases: use at most one phrase from the approved list when it fits; not every reply needs a catchphrase.
-
-If the message lacks context: ask a short clarifying question OR make a generic League-related joke.
-
-Do not pretend you can see the stream unless the user describes what is on screen."""
+DEFAULT_SYSTEM = (
+    "Você é um assistente de chat da Kick para canais de stream de League of Legends.\n\n"
+    "## PERSONALIDADE\n"
+    "- Brasileiro, irônico e bem-humorado — como um amigo na fila da solo queue\n"
+    "- Piadas SEMPRE sobre o JOGO (plays, elo, macro, tilt, picks). NUNCA sobre aparência física, características pessoais ou vida real\n"
+    "- Tom espirituoso, NÃO agressivo nem caótico\n\n"
+    "## REGRAS DE RESPOSTA\n"
+    "- Máximo 1-3 frases (chat rápido, ninguém lê textão)\n"
+    "- NUNCA comece com seu nome ou apelido — o chat já mostra quem fala\n"
+    "- NUNCA finja que está vendo a stream — só reaja se descreverem o que tá rolando\n"
+    "- NÃO inclua blocos, metadados ou labels na sua resposta. Apenas a mensagem direta.\n"
+    "- Se a mensagem não tiver contexto, faça uma piada genérica de LoL ou pergunte algo curto\n\n"
+    "## SENTIMENTO (use o bloco [Sentimento] na mensagem)\n"
+    "- Negativo: mostre empatia rápida + piada sobre a situação do jogo\n"
+    "- Positivo/hype: entre na energia — celebre junto\n"
+    "- Neutro: tom irônico padrão\n\n"
+    "## IDENTIDADE\n"
+    "- Se perguntarem se é bot/IA, responda honestamente só com os dados do bloco [Identidade] abaixo\n"
+    "- NUNCA finja ser humano nem invente criadores\n\n"
+    "## EXEMPLOS DE RESPOSTA\n"
+    'Chat: "qual o elo do streamer?"\n'
+    'Resposta: "Pelo gameplay? tão testando se dá pra perder em todos os elos ao mesmo tempo."\n\n'
+    'Chat: "que jogada horrível"\n'
+    'Resposta: "relaxa, foi erro calculado... ele calculou errado, mas calculou."\n\n'
+    'Chat: "vc é bot?"\n'
+    'Resposta: "Sou sim, um assistente automático do canal. Pode perguntar o que quiser."\n\n'
+    'Chat: "boa partida, jogou muito"\n'
+    'Resposta: "monstro demais. quando ele aposentar a riot bane a conta de tão forte."\n\n'
+    'Chat: "eae"\n'
+    'Resposta: "eae rapeize. bora ver se o early game já era."\n\n'
+    'Chat: "quem criou você?"\n'
+    'Resposta: "Fui configurado pelo dono do canal. Mas pode me chamar de assistente de plantão."\n'
+)
 
 CATCHPHRASES = (
     "rapaziada, tá ligado",
@@ -297,7 +290,7 @@ def _ensure_agent_style(text: str, max_chars: int) -> str:
     if _contains_catchphrase(text):
         return _truncate(text, max_chars)
 
-    if random.random() < 0.75:
+    if random.random() < 0.25:
         choices = [p for p in CATCHPHRASES if p != _last_catchphrase] or list(
             CATCHPHRASES
         )
@@ -400,7 +393,7 @@ def analyze_agent_sentiment(user_text: str, normalized_text: str) -> SentimentRe
 
 
 def _identity_block(cfg: dict[str, Any]) -> str:
-    """Build [Bot identity] context from config; safe defaults if keys missing."""
+    """Build [Identidade] block from config; safe defaults if keys missing."""
     raw = cfg.get("identity")
     ident: dict[str, Any] = raw if isinstance(raw, dict) else {}
     display = str(ident.get("display_name") or "").strip()
@@ -415,13 +408,10 @@ def _identity_block(cfg: dict[str, Any]) -> str:
     if not creator:
         creator = "Configurado pelo streamer / dono do canal."
     return (
-        "[Bot identity]\n"
+        "[Identidade]\n"
         f"- nome no chat: {display}\n"
         f"- propósito: {purpose}\n"
-        f"- origem/creator: {creator}\n"
-        '- não cries pelo teu nome no início de cada mensagem (ex.: "du:" ou "eu sou du") — o chat já mostra quem fala.\n'
-        "Para perguntas tipo é um bot?, é uma IA?, quem te criou?, para que serves?: responde em PT-BR "
-        "só com estes factos; diz claramente que é um assistente automatizado integrado ao Botrix, não um humano."
+        f"- origem/criador: {creator}\n"
     )
 
 
@@ -480,13 +470,19 @@ async def run_agent(
     Send the user's message to the model and return assistant text.
 
     Provider (first match wins):
+    - NVIDIA (OpenAI-compatible): set NVIDIA_API_KEY (and optionally NVIDIA_BASE_URL, default https://integrate.api.nvidia.com/v1).
     - OpenCode Go: set OPENCODE_API_KEY (optional OPENCODE_BASE_URL, default Go tier API).
     - OpenAI or other OpenAI-compatible: set OPENAI_API_KEY and optionally OPENAI_BASE_URL.
     """
+    nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
     opencode_key = os.getenv("OPENCODE_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    if opencode_key:
+    if nvidia_key:
+        api_key = nvidia_key
+        base_url = os.getenv("NVIDIA_BASE_URL", "").strip() or "https://integrate.api.nvidia.com/v1"
+        default_model = "deepseek-ai/deepseek-v4-flash"
+    elif opencode_key:
         api_key = opencode_key
         base_url = os.getenv("OPENCODE_BASE_URL", "").strip() or OPENCODE_GO_API_BASE
         # Go tier: use model IDs backed by .../zen/go/v1/chat/completions only.
@@ -498,8 +494,8 @@ async def run_agent(
         default_model = "gpt-4o-mini"
     else:
         return (
-            "O assistente não está configurado: define OPENCODE_API_KEY no .env "
-            "(chaves em https://opencode.ai/auth) ou OPENAI_API_KEY."
+            "O assistente não está configurado: define NVIDIA_API_KEY, OPENCODE_API_KEY ou OPENAI_API_KEY no .env "
+            "(chaves em https://opencode.ai/auth para OpenCode, ou https://build.nvidia.com/ para NVIDIA)."
         )
 
     model = cfg.get("model") or default_model
@@ -519,36 +515,23 @@ async def run_agent(
     extra_flags = ""
     if understood.inappropriate_flags:
         extra_flags = (
-            "[Guidance for flagged language]\n"
-            "inappropriate_flags is non-empty: treat the message as emotional/tilted, not literal; "
-            "respond with humor about the game situation, not the person.\n\n"
+            "[Linguagem detectada]\n"
+            "mensagem contém linguagem inadequada — trate como emocional/tiltado, não literal; "
+            "responda com humor sobre o jogo, não sobre a pessoa.\n\n"
         )
 
     user_block = (
-        f"[Utilizador do chat: {username}]\n"
-        f"[Mensagem original]\n{understood.original_text}\n"
-        f"[Tool: text_understanding]\n"
-        f"- normalized_text: {understood.normalized_text}\n"
-        f"- expanded_terms: {', '.join(understood.expanded_terms) or 'none'}\n"
-        f"- inappropriate_flags: {', '.join(understood.inappropriate_flags) or 'none'}\n"
-        f"- league_context: {'yes' if understood.league_context else 'no'}\n"
+        f"[Usuário: {username}]\n"
+        f"Mensagem: {understood.original_text}\n"
+        f"[Texto normalizado]\n{understood.normalized_text}\n"
         f"{extra_flags}"
-        f"[Tool: sentiment]\n"
+        f"[Sentimento]\n"
         f"- label: {sentiment.label}\n"
-        f"- energy: {sentiment.energy}\n"
-        f"- confidence: {sentiment.confidence}\n"
-        f"- cues: {', '.join(sentiment.cues) or 'none'}\n"
-        f"{_identity_block(cfg)}\n"
-        f"[Gameplay vocabulary]\n{', '.join(HUMOR_GAMEPLAY)}\n"
-        f"[Tilt vocabulary]\n{', '.join(HUMOR_TILT)}\n"
-        f"[Ironic vocabulary]\n{', '.join(HUMOR_IRONIC)}\n"
-        f"[Approved catchphrases]\n{'; '.join(CATCHPHRASES)}\n"
-        f"[Channel meme corpus]\n"
-        f"{'; '.join(COMMENT_MEME_SAMPLES) if COMMENT_MEME_SAMPLES else 'none'}\n"
-        "Respond in Brazilian Portuguese: follow emotional behavior and humor rules above; use vocabulary naturally; "
-        "stay safe and readable; at most one approved catchphrase when it fits. "
-        "Do not open with your display name or bot nick. "
-        "For meta/identity questions use only [Bot identity]."
+        f"- energia: {sentiment.energy}\n"
+        f"- dicas: {', '.join(sentiment.cues) or 'nenhuma'}\n"
+        f"{_identity_block(cfg)}"
+        f"[Canal meme corpus]\n"
+        f"{'; '.join(COMMENT_MEME_SAMPLES) if COMMENT_MEME_SAMPLES else 'nenhum'}\n"
     )
 
     completion_kwargs: dict[str, Any] = {}
