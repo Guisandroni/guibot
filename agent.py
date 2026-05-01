@@ -1,7 +1,8 @@
-"""LLM-backed replies for Kick chat (OpenAI-compatible API)."""
+"""LLM-backed replies for Kick chat (OpenCode Go tier or OpenAI-compatible API)."""
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
@@ -9,20 +10,52 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 
-DEFAULT_SYSTEM = """You are a hyper-energetic Kick stream assistant with an obsessive focus on League of Legends.
-Your vibe is intense, unhinged, and passionate like a ranked solo queue maniac, but never hateful or abusive.
+logger = logging.getLogger(__name__)
+
+DEFAULT_SYSTEM = """You are a Kick chat assistant for League of Legends streams.
+
+Your personality:
+- You act like a Brazilian stream viewer: funny, ironic, slightly sarcastic, and very familiar with League of Legends culture.
+- Your humor targets gameplay situations (bad plays, ranked struggles, macro mistakes, tilt), not personal attacks.
+
+Tone:
+- Witty and humorous, not chaotic or aggressive.
+- Use light exaggeration for comedic effect.
+
+Humor rules:
+- NEVER joke about real-world personal traits (appearance, body, etc.).
+- ALWAYS focus jokes on gameplay, decisions, or ranked experience.
+
+If a message includes insults or toxic language:
+- Do NOT repeat or reinforce the insult.
+- Redirect the humor toward the gameplay situation instead.
+
 Keep answers short (1-3 sentences) so they fit in chat.
 Always reply in Brazilian Portuguese.
 You know League of Legends deeply: champions, matchups, runes, items, macro, wave control, jungle tempo, objectives, drafts, and solo queue habits.
 Interpret chat slang, abbreviations, typos, and lightly censored profanity before responding.
-If a message is toxic or inappropriate, de-escalate it and redirect to constructive League of Legends talk.
-In every answer, include exactly one catchphrase from the approved list and keep the tone of Brazilian stream chat.
+If a message is toxic or inappropriate, de-escalate and redirect to constructive League talk.
+
+Emotional behavior (use the [Tool: sentiment] block in the user message):
+- Negative: acknowledge frustration briefly, then joke about the game situation.
+- Positive / high energy: match hype with playful humor.
+- Neutral: default to light ironic commentary.
+
+Identity / meta: When asked if you are a bot, AI, who created you, or what you do, answer briefly and honestly
+using ONLY the facts under [Bot identity]. Say openly that you are an automated assistant; never pretend to be human
+or invent creators not listed there.
+
+Do not start replies with your own name, nickname, or intros like "Eu sou X" / "X aqui:" / "X diz:" — the chat already shows who is speaking; go straight to the answer.
+
+Catchphrases: use at most one phrase from the approved list when it fits; not every reply needs a catchphrase.
+
+If the message lacks context: ask a short clarifying question OR make a generic League-related joke.
+
 Do not pretend you can see the stream unless the user describes what is on screen."""
 
 CATCHPHRASES = (
-    "Respeita geral nesse bagulho aí, falou qualquer m* é ban",
     "rapaziada, tá ligado",
     "bagulho é doido",
     "que isso chat",
@@ -41,9 +74,28 @@ CATCHPHRASES = (
     "olha isso chat",
     "que isso Jukera",
     "não é possível mano",
+    "Nicoloff estava certo",
 )
 
-STYLE_VOCABULARY = (
+HUMOR_GAMEPLAY = (
+    "macro inexistente",
+    "decisão duvidosa",
+    "jogador de highlight no treino",
+    "especialista em perder lane",
+    "solo queue experience",
+    "erro calculado",
+    "confia no scaling",
+    "late game imaginário",
+)
+
+HUMOR_TILT = (
+    "tiltou",
+    "isso não tava no plano",
+    "calma calma calma",
+    "vida que segue",
+)
+
+HUMOR_IRONIC = (
     "rapaziada",
     "rapeize",
     "família",
@@ -51,16 +103,17 @@ STYLE_VOCABULARY = (
     "bagulho",
     "menor",
     "chat",
-    "Jukera",
-    "Jukes",
     "confia no pai",
-    "vida que segue",
     "vai dar bom",
     "entretenimento",
-    "calma calma calma",
+    "Nicoloff estava certo",
 )
 
+STYLE_VOCABULARY: tuple[str, ...] = HUMOR_GAMEPLAY + HUMOR_TILT + HUMOR_IRONIC
+
 COMMENT_MEME_SAMPLES: tuple[str, ...] = ()
+
+_last_catchphrase: str | None = None
 
 ABBREVIATION_MAP = {
     "vc": "você",
@@ -239,14 +292,22 @@ def _contains_catchphrase(text: str) -> bool:
 
 
 def _ensure_agent_style(text: str, max_chars: int) -> str:
+    global _last_catchphrase
     text = text.strip()
     if _contains_catchphrase(text):
         return _truncate(text, max_chars)
 
-    phrase = random.choice(CATCHPHRASES)
-    separator = " " if text else ""
-    styled = f"{text}{separator}{phrase}."
-    return _truncate(styled, max_chars)
+    if random.random() < 0.75:
+        choices = [p for p in CATCHPHRASES if p != _last_catchphrase] or list(
+            CATCHPHRASES
+        )
+        phrase = random.choice(choices)
+        _last_catchphrase = phrase
+        separator = " " if text else ""
+        styled = f"{text}{separator}{phrase}."
+        return _truncate(styled, max_chars)
+
+    return _truncate(text, max_chars)
 
 
 def set_comment_meme_samples(samples: list[str]) -> None:
@@ -338,7 +399,75 @@ def analyze_agent_sentiment(user_text: str, normalized_text: str) -> SentimentRe
     )
 
 
-GROQ_API_BASE = "https://api.groq.com/openai/v1"
+def _identity_block(cfg: dict[str, Any]) -> str:
+    """Build [Bot identity] context from config; safe defaults if keys missing."""
+    raw = cfg.get("identity")
+    ident: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    display = str(ident.get("display_name") or "").strip()
+    if not display:
+        display = (
+            os.getenv("KICK_BOT_USERNAME", "").strip() or "este assistente do chat"
+        )
+    purpose = str(ident.get("purpose") or "").strip()
+    if not purpose:
+        purpose = "Comunicar com usuarios e responder duvidas a respeito do jogo league of legends"
+    creator = str(ident.get("creator_note") or "").strip()
+    if not creator:
+        creator = "Configurado pelo streamer / dono do canal."
+    return (
+        "[Bot identity]\n"
+        f"- nome no chat: {display}\n"
+        f"- propósito: {purpose}\n"
+        f"- origem/creator: {creator}\n"
+        '- não cries pelo teu nome no início de cada mensagem (ex.: "du:" ou "eu sou du") — o chat já mostra quem fala.\n'
+        "Para perguntas tipo é um bot?, é uma IA?, quem te criou?, para que serves?: responde em PT-BR "
+        "só com estes factos; diz claramente que é um assistente automatizado integrado ao Botrix, não um humano."
+    )
+
+
+def _strip_leading_bot_handle(text: str, cfg: dict[str, Any]) -> str:
+    """Remove leading self-name patterns (e.g. \"du:\", \"eu sou du\") left by the model."""
+    raw = cfg.get("identity")
+    ident: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    candidates: list[str] = []
+    for v in (ident.get("display_name"), os.getenv("KICK_BOT_USERNAME")):
+        s = str(v or "").strip()
+        if len(s) >= 2:
+            candidates.append(s)
+    seen: set[str] = set()
+    names: list[str] = []
+    for n in candidates:
+        key = n.lower()
+        if key not in seen:
+            seen.add(key)
+            names.append(n)
+    t = text.strip()
+    if not t or not names:
+        return t
+    lower = t.lower()
+    for name in names:
+        nl = name.lower()
+        for punct in (":", ",", "!", "?"):
+            pref = nl + punct
+            if lower.startswith(pref):
+                return t[len(pref) :].strip()
+        dash = nl + " -"
+        if lower.startswith(dash):
+            return t[len(dash) :].strip()
+        eu = "eu sou " + nl
+        if lower.startswith(eu):
+            rest = t[len(eu) :].lstrip()
+            if rest.startswith((",", ":", "!", "?", "-")):
+                rest = rest[1:].lstrip()
+            return rest
+        space_suffix = nl + " "
+        if lower.startswith(space_suffix) and len(t) > len(space_suffix):
+            return t[len(space_suffix) :].strip()
+    return t
+
+
+# Default: OpenCode "Go" model tier (OpenAI-compatible chat/completions under zen routing).
+OPENCODE_GO_API_BASE = "https://opencode.ai/zen/go/v1"
 
 
 async def run_agent(
@@ -351,34 +480,49 @@ async def run_agent(
     Send the user's message to the model and return assistant text.
 
     Provider (first match wins):
-    - Groq: set GROQ_API_KEY (optional GROQ_BASE_URL, default Groq OpenAI-compatible API).
-    - OpenAI ou outro: set OPENAI_API_KEY e opcionalmente OPENAI_BASE_URL.
+    - OpenCode Go: set OPENCODE_API_KEY (optional OPENCODE_BASE_URL, default Go tier API).
+    - OpenAI or other OpenAI-compatible: set OPENAI_API_KEY and optionally OPENAI_BASE_URL.
     """
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    opencode_key = os.getenv("OPENCODE_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    if groq_key:
-        api_key = groq_key
-        base_url = os.getenv("GROQ_BASE_URL", "").strip() or GROQ_API_BASE
-        default_model = "llama-3.3-70b-versatile"
+    if opencode_key:
+        api_key = opencode_key
+        base_url = os.getenv("OPENCODE_BASE_URL", "").strip() or OPENCODE_GO_API_BASE
+        # Go tier: use model IDs backed by .../zen/go/v1/chat/completions only.
+        # IDs served only via .../messages (e.g. MiniMax M2.x on Go) need a different client.
+        default_model = "glm-5.1"
     elif openai_key:
         api_key = openai_key
         base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         default_model = "gpt-4o-mini"
     else:
         return (
-            "O assistente não está configurado: define GROQ_API_KEY no .env "
-            "(consola https://console.groq.com/keys) ou OPENAI_API_KEY."
+            "O assistente não está configurado: define OPENCODE_API_KEY no .env "
+            "(chaves em https://opencode.ai/auth) ou OPENAI_API_KEY."
         )
 
     model = cfg.get("model") or default_model
     max_tokens = int(cfg.get("max_tokens", 256))
-    max_chars = int(cfg.get("max_response_chars", 380))
+    max_chars = int(cfg.get("max_response_chars", 280))
     system = cfg.get("system_prompt") or DEFAULT_SYSTEM
+    mod_cfg = cfg.get("moderation")
+    if isinstance(mod_cfg, dict) and mod_cfg.get("enabled", False):
+        extra = str(mod_cfg.get("system_append") or "").strip()
+        if extra:
+            system = f"{system.rstrip()}\n\n{extra}"
 
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
     understood = understand_chat_text(user_text)
     sentiment = analyze_agent_sentiment(user_text, understood.normalized_text)
+
+    extra_flags = ""
+    if understood.inappropriate_flags:
+        extra_flags = (
+            "[Guidance for flagged language]\n"
+            "inappropriate_flags is non-empty: treat the message as emotional/tilted, not literal; "
+            "respond with humor about the game situation, not the person.\n\n"
+        )
 
     user_block = (
         f"[Utilizador do chat: {username}]\n"
@@ -388,29 +532,71 @@ async def run_agent(
         f"- expanded_terms: {', '.join(understood.expanded_terms) or 'none'}\n"
         f"- inappropriate_flags: {', '.join(understood.inappropriate_flags) or 'none'}\n"
         f"- league_context: {'yes' if understood.league_context else 'no'}\n"
+        f"{extra_flags}"
         f"[Tool: sentiment]\n"
         f"- label: {sentiment.label}\n"
         f"- energy: {sentiment.energy}\n"
         f"- confidence: {sentiment.confidence}\n"
         f"- cues: {', '.join(sentiment.cues) or 'none'}\n"
-        f"[Style vocabulary]\n{', '.join(STYLE_VOCABULARY)}\n"
+        f"{_identity_block(cfg)}\n"
+        f"[Gameplay vocabulary]\n{', '.join(HUMOR_GAMEPLAY)}\n"
+        f"[Tilt vocabulary]\n{', '.join(HUMOR_TILT)}\n"
+        f"[Ironic vocabulary]\n{', '.join(HUMOR_IRONIC)}\n"
         f"[Approved catchphrases]\n{'; '.join(CATCHPHRASES)}\n"
         f"[Channel meme corpus]\n"
         f"{'; '.join(COMMENT_MEME_SAMPLES) if COMMENT_MEME_SAMPLES else 'none'}\n"
-        "Respond in Brazilian Portuguese as a League of Legends obsessed stream maniac, "
-        "reuse the channel's meme vocabulary naturally, but keep it safe, readable, "
-        "and include exactly one approved catchphrase."
+        "Respond in Brazilian Portuguese: follow emotional behavior and humor rules above; use vocabulary naturally; "
+        "stay safe and readable; at most one approved catchphrase when it fits. "
+        "Do not open with your display name or bot nick. "
+        "For meta/identity questions use only [Bot identity]."
     )
 
-    response = await client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_block},
-        ],
-    )
+    completion_kwargs: dict[str, Any] = {}
+    if cfg.get("temperature") is not None:
+        try:
+            completion_kwargs["temperature"] = float(cfg["temperature"])
+        except (TypeError, ValueError):
+            logger.warning(
+                "Ignoring invalid agent.temperature: %s", cfg.get("temperature")
+            )
+    if cfg.get("top_p") is not None:
+        try:
+            completion_kwargs["top_p"] = float(cfg["top_p"])
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid agent.top_p: %s", cfg.get("top_p"))
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_block},
+            ],
+            **completion_kwargs,
+        )
+    except APIError as exc:
+        err_lower = str(exc).lower()
+        code = getattr(exc, "status_code", None)
+        if code == 401 and (
+            "insufficient balance" in err_lower
+            or "creditserror" in err_lower
+            or "credits" in err_lower
+        ):
+            logger.warning("OpenCode: insufficient balance / credits (401)")
+            return (
+                "conta OpenCode sem saldo/créditos — adiciona em "
+                "https://opencode.ai (billing). Depois disso volto a responder."
+            )
+        if code == 429:
+            return "rate limit da API — espera um pouco e tenta de novo."
+        logger.warning("LLM API error: %s", exc)
+        return (
+            "erro ao chamar o modelo (API). Verifica chave, modelo e quota no OpenCode."
+        )
+
     choice = response.choices[0].message.content
     if not choice:
         return "Não consegui gerar uma resposta. Tenta de novo."
-    return _ensure_agent_style(choice, max_chars)
+    cleaned = _strip_leading_bot_handle(choice, cfg)
+    return _ensure_agent_style(cleaned, max_chars)

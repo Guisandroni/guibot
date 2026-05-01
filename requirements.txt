@@ -1,4 +1,6 @@
 kickforge>=0.3.0
 pyyaml>=6.0
 openai>=1.0.0
+# Carrega .env em bot.py e em scripts/kickforge_auth.py (o binário kickforge auth só usa cwd sem path).
 python-dotenv>=1.0.0
+pytest>=8.0.0
