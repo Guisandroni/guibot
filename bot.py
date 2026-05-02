@@ -1,4 +1,7 @@
-"""Kick chatbot with commands, timers, optional chat moderation, and optional AI replies.
+"""Kick chatbot with commands, timers, optional AI replies, etc.
+
+Loads ``.env`` and ``config.yaml`` from the directory that contains this file
+(so you can run ``python bot.py`` from any working directory).
 
 Multiple chats in one process: set ``KICK_CHANNELS=slug1,slug2`` (requires ``KICK_MODE=websocket``).
 Moderation (timeouts, deletes) applies only to slugs in ``KICK_MODERATION_CHANNELS`` or
@@ -23,7 +26,12 @@ from kickforge_core import KickApp, KickForgeError
 from kickforge_core.websocket import PusherClient
 from dotenv import load_dotenv
 
-from agent import AgentCooldown, run_agent, set_comment_meme_samples
+from agent import AgentCooldown, probe_llm, run_agent, set_comment_meme_samples
+from chat_activity import (
+    ChatActivityStore,
+    channel_key_from_bid,
+    parse_window_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +41,11 @@ if not logging.getLogger().hasHandlers():
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
+PACKAGE_ROOT = Path(__file__).resolve().parent
+
 URL_PATTERN = re.compile(r"https?://\S+|www\.\S+|\S+\.\S+/\S+", re.IGNORECASE)
+# Outbound chat: bare https URLs trigger Kick MAX_SPECIAL_CHARS_ERROR on some messages.
+HTTP_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 CHAT_MESSAGE_MAX_BYTES = 380
 WEBHOOK_EVENTS = [
     "chat.message.sent",
@@ -46,8 +58,9 @@ WEBHOOK_EVENTS = [
 
 
 def _load_config() -> dict[str, Any]:
+    cfg_path = PACKAGE_ROOT / "config.yaml"
     try:
-        with open("config.yaml", encoding="utf-8") as file:
+        with open(cfg_path, encoding="utf-8") as file:
             return yaml.safe_load(file) or {}
     except FileNotFoundError:
         return {}
@@ -74,6 +87,8 @@ def _parse_channel_slugs(kcfg: dict[str, Any]) -> list[str]:
     return [single] if single else []
 
 
+load_dotenv(PACKAGE_ROOT / ".env")
+
 config = _load_config()
 kick_cfg = config.get("kick") or {}
 webhook_cfg = config.get("webhook") or {}
@@ -81,8 +96,7 @@ bot_cfg = config.get("bot") or {}
 agent_cfg = config.get("agent") or {}
 moderation_cfg = bot_cfg.get("moderation") or {}
 comments_cfg = bot_cfg.get("comment_spam") or {}
-
-load_dotenv()
+chat_activity_cfg = bot_cfg.get("chat_activity") or {}
 
 
 def _kick_chat_poster_type() -> str:
@@ -147,6 +161,9 @@ channel_sessions: list[ChannelSession] = []
 moderation_broadcaster_ids: set[int] = set()
 primary_broadcaster_id: int | None = None
 multichannel_pushers: list[PusherClient] = []
+
+chat_activity_store: ChatActivityStore | None = None
+chat_session_started_at: float | None = None
 
 
 def _moderation_slug_list() -> list[str]:
@@ -279,6 +296,7 @@ def _is_spam(sender_id: int, message: str) -> bool:
 
 
 def _fit_chat_message(message: str, max_bytes: int = CHAT_MESSAGE_MAX_BYTES) -> str:
+    message = HTTP_URL_RE.sub("", message)
     message = " ".join(message.split()).strip()
     if len(message.encode("utf-8")) <= max_bytes:
         return message
@@ -359,7 +377,7 @@ def _load_comment_corpus() -> tuple[list[str], list[str]]:
     sample_limit = int(comments_cfg.get("prompt_samples", 12))
     base_path = Path(directory)
     if not base_path.is_absolute():
-        base_path = Path.cwd() / base_path
+        base_path = PACKAGE_ROOT / base_path
 
     spam_candidates: list[str] = []
     prompt_candidates: list[str] = []
@@ -571,6 +589,7 @@ async def on_chat(event: Any) -> None:
     username = event.sender.username
     reply_to = getattr(event, "message_id", None)
     channel_bid = getattr(event, "broadcaster_user_id", None)
+    prefix = str(bot_cfg.get("prefix") or "!").strip()
 
     if not msg or _is_self_message(username):
         return
@@ -583,6 +602,23 @@ async def on_chat(event: Any) -> None:
 
     if moderation_cfg.get("enabled", True) and await _handle_moderation(
         event, msg, reply_to=reply_to, channel_bid=channel_bid
+    ):
+        return
+
+    if chat_activity_store and chat_activity_cfg.get("enabled"):
+        if _should_count_chat_activity_message(msg, prefix):
+            await chat_activity_store.record(
+                _resolve_chat_activity_channel_key(channel_bid),
+                username,
+            )
+
+    if await _handle_chat_activity_commands(
+        event,
+        msg,
+        username,
+        reply_to,
+        channel_bid,
+        prefix=prefix,
     ):
         return
 
@@ -617,7 +653,6 @@ async def on_chat(event: Any) -> None:
         await _safe_say(f"@{username} {reply}", reply_to=reply_to, broadcaster_id=channel_bid)
         return
 
-    prefix = str(bot_cfg.get("prefix") or "!").strip()
     if msg.startswith(prefix):
         parts = msg.split()
         cmd = parts[0][len(prefix) :].lower()
@@ -688,6 +723,179 @@ def _existing_subscription_names(payload: dict[str, Any]) -> set[str]:
         if isinstance(name, str) and name:
             names.add(name)
     return names
+
+
+def _resolve_chat_activity_channel_key(channel_bid: int | None) -> str:
+    fb = str(primary_broadcaster_id) if primary_broadcaster_id else "default"
+    return channel_key_from_bid(channel_bid, fb)
+
+
+def _should_count_chat_activity_message(message: str, prefix: str) -> bool:
+    if chat_activity_cfg.get("count_command_messages", True):
+        return True
+    return not message.startswith(prefix)
+
+
+async def _init_chat_activity_store() -> None:
+    global chat_activity_store, chat_session_started_at
+    chat_activity_store = None
+    chat_session_started_at = None
+    if not chat_activity_cfg.get("enabled", False):
+        return
+    path_raw = str(chat_activity_cfg.get("path") or "data/chat_activity.json").strip()
+    path = Path(path_raw)
+    if not path.is_absolute():
+        path = PACKAGE_ROOT / path
+    store = ChatActivityStore(
+        path,
+        max_retention_seconds=int(chat_activity_cfg.get("max_retention_seconds", 604800)),
+        max_events_per_channel=int(chat_activity_cfg.get("max_events_per_channel", 50_000)),
+        debounce_seconds=float(chat_activity_cfg.get("debounce_seconds", 1.5)),
+    )
+    try:
+        await store.load()
+    except Exception:
+        logger.exception("Chat activity load failed; stats disabled.")
+        return
+    chat_activity_store = store
+    chat_session_started_at = time.time()
+    logger.info(
+        "Chat activity enabled (file=%s, session_ts=%s)",
+        path,
+        chat_session_started_at,
+    )
+
+
+async def _handle_chat_activity_commands(
+    event: Any,
+    msg: str,
+    username: str,
+    reply_to: str | None,
+    channel_bid: int | None,
+    *,
+    prefix: str,
+) -> bool:
+    """Handle !sorteio / !topchat / !clear. Returns True if handled."""
+    if not chat_activity_store or not chat_activity_cfg.get("enabled"):
+        return False
+    if not msg.startswith(prefix):
+        return False
+    parts = msg.split()
+    if not parts:
+        return False
+    cmd = parts[0][len(prefix) :].lower()
+    if cmd not in ("sorteio", "topchat", "clear"):
+        return False
+
+    ck = _resolve_chat_activity_channel_key(channel_bid)
+
+    if cmd == "clear":
+        if chat_activity_cfg.get("clear_mods_only", True) and not _is_privileged(
+            event.sender
+        ):
+            await _safe_say(
+                f"@{username} só mods/streamer podem usar !clear.",
+                reply_to=reply_to,
+                broadcaster_id=channel_bid,
+            )
+            return True
+
+        cooldown_seconds = float(chat_activity_cfg.get("cooldown_clear", 10))
+        remaining = _remaining_cooldown("clear", username, cooldown_seconds)
+        if remaining > 0:
+            await _safe_say(
+                f"@{username} espera {int(remaining) + 1}s para !clear.",
+                reply_to=reply_to,
+                broadcaster_id=channel_bid,
+            )
+            return True
+        _mark_command_used("clear", username)
+
+        await chat_activity_store.clear_channel(ck)
+        await _safe_say(
+            _fit_chat_message(
+                "Stats deste canal limpas (mensagens guardadas pelo bot). "
+                "Novas msgs voltam a contar daqui."
+            ),
+            reply_to=reply_to,
+            broadcaster_id=channel_bid,
+        )
+        return True
+
+    if cmd == "sorteio" and chat_activity_cfg.get(
+        "sorteio_mods_only"
+    ) and not _is_privileged(event.sender):
+        await _safe_say(
+            f"@{username} só mods/streamer podem usar !sorteio.",
+            reply_to=reply_to,
+            broadcaster_id=channel_bid,
+        )
+        return True
+
+    cooldown_key = "sorteio" if cmd == "sorteio" else "topchat"
+    cooldown_seconds = float(
+        chat_activity_cfg.get(
+            "cooldown_sorteio" if cmd == "sorteio" else "cooldown_topchat",
+            60 if cmd == "sorteio" else 30,
+        )
+    )
+    remaining = _remaining_cooldown(cooldown_key, username, cooldown_seconds)
+    if remaining > 0:
+        await _safe_say(
+            f"@{username} espera {int(remaining) + 1}s para !{cmd}.",
+            reply_to=reply_to,
+            broadcaster_id=channel_bid,
+        )
+        return True
+    _mark_command_used(cooldown_key, username)
+
+    sess_ts = chat_session_started_at
+
+    parsed_window = parse_window_seconds(parts)
+    default_session = bool(chat_activity_cfg.get("default_sorteio_use_session", True))
+    default_win = float(chat_activity_cfg.get("default_sorteio_window_seconds", 3600))
+
+    if parsed_window is not None:
+        use_session_only = False
+        window_sec = float(parsed_window)
+    else:
+        use_session_only = default_session
+        window_sec = default_win
+
+    if cmd == "sorteio":
+        winner, counts = chat_activity_store.pick_sorteio_winner(
+            ck,
+            window_sec,
+            session_start_ts=sess_ts,
+            use_session_only=use_session_only,
+        )
+        if winner is None:
+            out = "Ninguém na disputa (sem msgs no período)."
+        else:
+            wcount = counts.get(winner, 0)
+            best = max(counts.values())
+            n_tied = sum(1 for c in counts.values() if c == best)
+            tie_note = f" Empate no topo: {n_tied}." if n_tied > 1 else ""
+            out = f"Sorteio: @{winner} — {wcount} msgs.{tie_note}"
+        await _safe_say(_fit_chat_message(out), reply_to=reply_to, broadcaster_id=channel_bid)
+        return True
+
+    counts = chat_activity_store.get_counts_for_scope(
+        ck,
+        window_sec,
+        session_start_ts=sess_ts,
+        use_session_only=use_session_only,
+    )
+    limit = int(chat_activity_cfg.get("topchat_limit", 5))
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[: max(1, limit)]
+    nu = len(counts)
+    if not ranked:
+        out = "Top chat: ninguém no período."
+    else:
+        bits = [f"{u}({c})" for u, c in ranked]
+        out = f"Top: {' · '.join(bits)} | {nu} users."
+    await _safe_say(_fit_chat_message(out), reply_to=reply_to, broadcaster_id=channel_bid)
+    return True
 
 
 async def _resolve_channel_session(slug: str) -> ChannelSession:
@@ -763,6 +971,16 @@ async def prepare_app() -> None:
                 ", ".join(sorted(mod_slugs)),
             )
 
+        if agent_cfg.get("enabled"):
+            ok, probe_msg = await probe_llm(agent_cfg)
+            if ok:
+                logger.info("LLM probe: %s", probe_msg)
+            else:
+                logger.warning(
+                    "LLM probe falhou — comandos do agente podem falhar: %s",
+                    probe_msg,
+                )
+
         if app_mode in {"webhook", "hybrid"}:
             existing = _existing_subscription_names(await app.api.get_subscriptions())
             missing = [name for name in WEBHOOK_EVENTS if name not in existing]
@@ -771,6 +989,8 @@ async def prepare_app() -> None:
                 logger.info("Created webhook subscriptions: %s", ", ".join(missing))
             else:
                 logger.info("Webhook subscriptions already present")
+
+        await _init_chat_activity_store()
     finally:
         await app.api.close()
 

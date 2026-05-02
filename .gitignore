@@ -3,5 +3,6 @@ __pycache__/
 .env
 config.yaml
 comments/
+data/
 .venv/
 bot.log

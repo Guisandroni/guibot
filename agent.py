@@ -1,4 +1,8 @@
-"""LLM-backed replies for Kick chat (OpenCode Go tier or OpenAI-compatible API)."""
+"""LLM-backed replies for Kick chat (NVIDIA NIM, OpenCode Go, or OpenAI-compatible).
+
+Default model IDs per provider (overridden by ``agent.model`` in config):
+NVIDIA → ``deepseek-ai/deepseek-v4-flash``; OpenCode Go → ``glm-5.1``; OpenAI → ``gpt-4o-mini``.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from openai import APIError, AsyncOpenAI
 
@@ -458,6 +462,121 @@ def _strip_leading_bot_handle(text: str, cfg: dict[str, Any]) -> str:
 
 # Default: OpenCode "Go" model tier (OpenAI-compatible chat/completions under zen routing).
 OPENCODE_GO_API_BASE = "https://opencode.ai/zen/go/v1"
+NVIDIA_DEFAULT_BASE = "https://integrate.api.nvidia.com/v1"
+
+
+class ResolvedLLM(NamedTuple):
+    provider: str  # nvidia | opencode | openai
+    api_key: str
+    base_url: str | None
+    model: str
+
+
+def _opencode_model_from_cfg(cfg: dict[str, Any], default_model: str) -> str:
+    """OpenCode Go chat/completions rejects NVIDIA Build-style IDs (org/model)."""
+    raw = str(cfg.get("model") or default_model).strip()
+    if "/" in raw:
+        logger.warning(
+            "OpenCode Go não suporta o ID %r (formato catálogo NVIDIA). "
+            "A usar glm-5.1. Para DeepSeek na NVIDIA define NVIDIA_API_KEY no .env.",
+            raw,
+        )
+        return "glm-5.1"
+    return raw
+
+
+def _resolve_llm(cfg: dict[str, Any]) -> ResolvedLLM | None:
+    """Pick provider (env order: NVIDIA → OpenCode → OpenAI) and merge cfg.model."""
+    nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
+    opencode_key = os.getenv("OPENCODE_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if nvidia_key:
+        base = os.getenv("NVIDIA_BASE_URL", "").strip() or NVIDIA_DEFAULT_BASE
+        default_model = "deepseek-ai/deepseek-v4-flash"
+        return ResolvedLLM(
+            "nvidia",
+            nvidia_key,
+            base,
+            str(cfg.get("model") or default_model).strip(),
+        )
+    if opencode_key:
+        base = os.getenv("OPENCODE_BASE_URL", "").strip() or OPENCODE_GO_API_BASE
+        default_model = "glm-5.1"
+        return ResolvedLLM(
+            "opencode",
+            opencode_key,
+            base,
+            _opencode_model_from_cfg(cfg, default_model),
+        )
+    if openai_key:
+        base_raw = os.getenv("OPENAI_BASE_URL", "").strip()
+        base: str | None = base_raw or None
+        default_model = "gpt-4o-mini"
+        return ResolvedLLM(
+            "openai",
+            openai_key,
+            base,
+            str(cfg.get("model") or default_model).strip(),
+        )
+    return None
+
+
+def _llm_help_hint(provider: str) -> str:
+    """Long hint for logs only (may contain URLs)."""
+    if provider == "nvidia":
+        return (
+            "Verifica NVIDIA_API_KEY, NVIDIA_BASE_URL (se usares um custom), "
+            "o nome exacto do modelo no catálogo Build e quota em https://build.nvidia.com/"
+        )
+    if provider == "opencode":
+        return (
+            "Verifica OPENCODE_API_KEY, agent.model no tier Go e quota em https://opencode.ai/"
+        )
+    return "Verifica OPENAI_API_KEY, OPENAI_BASE_URL e quotas na API."
+
+
+def _llm_chat_error_short(provider: str) -> str:
+    """Kick chat rejects long replies with URLs (MAX_SPECIAL_CHARS_ERROR)."""
+    if provider == "nvidia":
+        return "Erro na API. Ver env NVIDIA e modelo no Build."
+    if provider == "opencode":
+        return "Erro na API OpenCode. Ver modelo Go no config ou usa NVIDIA_API_KEY para DeepSeek."
+    return "Erro na API. Ver OPENAI_API_KEY e modelo."
+
+
+async def probe_llm(cfg: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Minimal chat completion with the configured model (validates key + model ID).
+
+    ``GET /v1/models`` alone is not enough: OpenCode returns 200 while chat rejects
+    NVIDIA-style model IDs.
+    """
+    resolved = _resolve_llm(cfg)
+    if resolved is None:
+        return False, "sem chave LLM no .env (NVIDIA_API_KEY / OPENCODE_API_KEY / OPENAI_API_KEY)"
+
+    client = AsyncOpenAI(api_key=resolved.api_key, base_url=resolved.base_url)
+    base_log = resolved.base_url or "https://api.openai.com/v1"
+    try:
+        await client.chat.completions.create(
+            model=resolved.model,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "."}],
+        )
+        return (
+            True,
+            f"{resolved.provider} endpoint OK (base_url={base_log}, model={resolved.model})",
+        )
+    except APIError as exc:
+        return False, f"{resolved.provider}: {exc}"
+    except Exception as exc:
+        return False, f"{resolved.provider}: {exc}"
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 async def run_agent(
@@ -474,31 +593,14 @@ async def run_agent(
     - OpenCode Go: set OPENCODE_API_KEY (optional OPENCODE_BASE_URL, default Go tier API).
     - OpenAI or other OpenAI-compatible: set OPENAI_API_KEY and optionally OPENAI_BASE_URL.
     """
-    nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
-    opencode_key = os.getenv("OPENCODE_API_KEY", "").strip()
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-
-    if nvidia_key:
-        api_key = nvidia_key
-        base_url = os.getenv("NVIDIA_BASE_URL", "").strip() or "https://integrate.api.nvidia.com/v1"
-        default_model = "deepseek-ai/deepseek-v4-flash"
-    elif opencode_key:
-        api_key = opencode_key
-        base_url = os.getenv("OPENCODE_BASE_URL", "").strip() or OPENCODE_GO_API_BASE
-        # Go tier: use model IDs backed by .../zen/go/v1/chat/completions only.
-        # IDs served only via .../messages (e.g. MiniMax M2.x on Go) need a different client.
-        default_model = "glm-5.1"
-    elif openai_key:
-        api_key = openai_key
-        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
-        default_model = "gpt-4o-mini"
-    else:
+    resolved = _resolve_llm(cfg)
+    if resolved is None:
         return (
-            "O assistente não está configurado: define NVIDIA_API_KEY, OPENCODE_API_KEY ou OPENAI_API_KEY no .env "
-            "(chaves em https://opencode.ai/auth para OpenCode, ou https://build.nvidia.com/ para NVIDIA)."
+            "Assistente nao configurado: define NVIDIA_API_KEY ou OPENCODE_API_KEY ou OPENAI_API_KEY no env."
         )
 
-    model = cfg.get("model") or default_model
+    provider = resolved.provider
+    model = resolved.model
     max_tokens = int(cfg.get("max_tokens", 256))
     max_chars = int(cfg.get("max_response_chars", 280))
     system = cfg.get("system_prompt") or DEFAULT_SYSTEM
@@ -508,7 +610,7 @@ async def run_agent(
         if extra:
             system = f"{system.rstrip()}\n\n{extra}"
 
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    client = AsyncOpenAI(api_key=resolved.api_key, base_url=resolved.base_url)
     understood = understand_chat_text(user_text)
     sentiment = analyze_agent_sentiment(user_text, understood.normalized_text)
 
@@ -561,22 +663,24 @@ async def run_agent(
     except APIError as exc:
         err_lower = str(exc).lower()
         code = getattr(exc, "status_code", None)
-        if code == 401 and (
+        if provider == "opencode" and code == 401 and (
             "insufficient balance" in err_lower
             or "creditserror" in err_lower
             or "credits" in err_lower
         ):
             logger.warning("OpenCode: insufficient balance / credits (401)")
             return (
-                "conta OpenCode sem saldo/créditos — adiciona em "
-                "https://opencode.ai (billing). Depois disso volto a responder."
+                "OpenCode sem saldo ou creditos. Resolve no billing e tenta de novo."
             )
         if code == 429:
-            return "rate limit da API — espera um pouco e tenta de novo."
-        logger.warning("LLM API error: %s", exc)
-        return (
-            "erro ao chamar o modelo (API). Verifica chave, modelo e quota no OpenCode."
-        )
+            return "rate limit na API, espera um pouco."
+        logger.warning("LLM API error (%s): %s", provider, exc)
+        logger.info("LLM hint (logs): %s", _llm_help_hint(provider))
+        return _llm_chat_error_short(provider)
+    except Exception as exc:
+        logger.warning("LLM request failed (%s, non-API): %s", provider, exc)
+        logger.info("LLM hint (logs): %s", _llm_help_hint(provider))
+        return _llm_chat_error_short(provider)
 
     choice = response.choices[0].message.content
     if not choice:
