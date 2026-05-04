@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -39,9 +40,18 @@ _TIME_SUFFIX_SECONDS: dict[str, int] = {
     "horas": 3600,
 }
 
+_VALID_TIERS = frozenset({"none", "sub", "vip"})
+
 
 def normalize_username(username: str) -> str:
     return username.strip().lower()
+
+
+def normalize_tier(raw: str | None) -> str:
+    if not raw:
+        return "none"
+    t = str(raw).strip().lower()
+    return t if t in _VALID_TIERS else "none"
 
 
 def parse_window_seconds(parts: list[str]) -> int | None:
@@ -135,8 +145,12 @@ class ChatActivityStore:
                     u = str(item["u"]).strip().lower()
                 except (KeyError, TypeError, ValueError):
                     continue
-                if u:
-                    events.append({"t": ts, "u": u})
+                if not u:
+                    continue
+                ev: dict[str, Any] = {"t": ts, "u": u}
+                if "tier" in item:
+                    ev["tier"] = normalize_tier(str(item.get("tier")))
+                events.append(ev)
             loaded[k] = events
         self._channels = loaded
         self._trim_retention()
@@ -179,14 +193,15 @@ class ChatActivityStore:
 
         self._save_task = loop.create_task(_debounced())
 
-    async def record(self, channel_key: str, username: str) -> None:
+    async def record(self, channel_key: str, username: str, tier: str = "none") -> None:
         u = normalize_username(username)
         if not u:
             return
+        tier_n = normalize_tier(tier)
         now = time.time()
         async with self._lock:
             evs = self._channels.setdefault(channel_key, [])
-            evs.append({"t": now, "u": u})
+            evs.append({"t": now, "u": u, "tier": tier_n})
             self._trim_retention(now)
             self._trim_cap(channel_key)
         self._schedule_save()
@@ -216,6 +231,30 @@ class ChatActivityStore:
                 out.append(e)
         return out
 
+    def _events_session(self, channel_key: str, session_start_ts: float) -> list[dict[str, Any]]:
+        evs = self._channels.get(channel_key, [])
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for e in evs:
+            t = float(e.get("t", 0))
+            if t >= session_start_ts and t <= now:
+                out.append(e)
+        return out
+
+    def events_for_sorteio_scope(
+        self,
+        channel_key: str,
+        window_seconds: float,
+        *,
+        session_start_ts: float | None,
+        use_session_only: bool,
+    ) -> list[dict[str, Any]]:
+        if use_session_only and session_start_ts is not None:
+            return self._events_session(channel_key, session_start_ts)
+        return self._events_for_window(
+            channel_key, window_seconds, session_start_ts=session_start_ts
+        )
+
     def counts_in_window(
         self,
         channel_key: str,
@@ -237,13 +276,8 @@ class ChatActivityStore:
         channel_key: str,
         session_start_ts: float,
     ) -> dict[str, int]:
-        evs = self._channels.get(channel_key, [])
-        now = time.time()
         counts: dict[str, int] = {}
-        for e in evs:
-            t = float(e.get("t", 0))
-            if t < session_start_ts or t > now:
-                continue
+        for e in self._events_session(channel_key, session_start_ts):
             u = str(e.get("u", ""))
             if u:
                 counts[u] = counts.get(u, 0) + 1
@@ -265,7 +299,7 @@ class ChatActivityStore:
             session_start_ts=session_start_ts,
         )
 
-    def pick_sorteio_winner(
+    def pick_sorteio_top_messages(
         self,
         channel_key: str,
         window_seconds: float,
@@ -284,6 +318,110 @@ class ChatActivityStore:
         best = max(counts.values())
         tied = [u for u, c in counts.items() if c == best]
         return random.choice(tied), counts
+
+    def pick_sorteio_weighted(
+        self,
+        channel_key: str,
+        window_seconds: float,
+        *,
+        session_start_ts: float | None,
+        use_session_only: bool,
+        multiplier_default: float,
+        multiplier_subscriber: float,
+        multiplier_vip: float,
+    ) -> tuple[str | None, dict[str, float], dict[str, int]]:
+        """
+        Bilhetes por mensagem conforme tier. Retorna (winner, tickets_por_user, msg_counts).
+        """
+        events = self.events_for_sorteio_scope(
+            channel_key,
+            window_seconds,
+            session_start_ts=session_start_ts,
+            use_session_only=use_session_only,
+        )
+        md = max(0.0, float(multiplier_default))
+        ms = max(0.0, float(multiplier_subscriber))
+        mv = max(0.0, float(multiplier_vip))
+        tier_mult = {"none": md, "sub": ms, "vip": mv}
+
+        tickets: dict[str, float] = defaultdict(float)
+        msg_counts: dict[str, int] = defaultdict(int)
+
+        for e in events:
+            u = str(e.get("u", "")).strip().lower()
+            if not u:
+                continue
+            tier = normalize_tier(str(e.get("tier")))
+            m = tier_mult.get(tier, md)
+            tickets[u] += m
+            msg_counts[u] += 1
+
+        if not tickets:
+            return None, {}, {}
+
+        total = sum(tickets.values())
+        if total <= 0:
+            return None, dict(tickets), dict(msg_counts)
+
+        r = random.random() * total
+        winner: str | None = None
+        for u in sorted(tickets.keys()):
+            r -= tickets[u]
+            if r < 0:
+                winner = u
+                break
+        if winner is None:
+            winner = sorted(tickets.keys())[-1]
+        return winner, dict(tickets), dict(msg_counts)
+
+    def pick_sorteio_winner(
+        self,
+        channel_key: str,
+        window_seconds: float,
+        *,
+        session_start_ts: float | None,
+        use_session_only: bool,
+        mode: str = "top_messages",
+        multiplier_default: float = 1.0,
+        multiplier_subscriber: float = 10.0,
+        multiplier_vip: float = 10.0,
+    ) -> tuple[str | None, dict[str, int], dict[str, Any]]:
+        """
+        mode: top_messages | weighted
+
+        Retorna (winner, counts_for_display, meta).
+        counts_for_display: contagens de mensagens em ambos os modos (para mensagem ao chat).
+        meta inclui tickets em modo weighted.
+        """
+        meta: dict[str, Any] = {"mode": mode}
+        counts = self.get_counts_for_scope(
+            channel_key,
+            window_seconds,
+            session_start_ts=session_start_ts,
+            use_session_only=use_session_only,
+        )
+
+        if mode == "weighted":
+            w, tickets, msg_counts = self.pick_sorteio_weighted(
+                channel_key,
+                window_seconds,
+                session_start_ts=session_start_ts,
+                use_session_only=use_session_only,
+                multiplier_default=multiplier_default,
+                multiplier_subscriber=multiplier_subscriber,
+                multiplier_vip=multiplier_vip,
+            )
+            meta["tickets"] = tickets
+            meta["message_counts"] = msg_counts
+            return w, counts, meta
+
+        win, _ = self.pick_sorteio_top_messages(
+            channel_key,
+            window_seconds,
+            session_start_ts=session_start_ts,
+            use_session_only=use_session_only,
+        )
+        return win, counts, meta
 
 
 def channel_key_from_bid(broadcaster_user_id: Any, fallback: str = "default") -> str:

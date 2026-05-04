@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import json
 import logging
 import os
-from pathlib import Path
 import random
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
@@ -31,6 +33,14 @@ from chat_activity import (
     ChatActivityStore,
     channel_key_from_bid,
     parse_window_seconds,
+)
+from kick_chat_identity import classify_sender_tier
+from riot_lol_rank import (
+    expand_leagueoflegends_macros,
+    fetch_solo_rank_line,
+    known_platforms,
+    resolve_rank_query,
+    riot_tokens_after_command,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,6 +159,8 @@ comment_prompt_samples: list[str] = []
 # Cache de mensagens enviadas pelo bot para evitar loop quando chat_poster_type=user
 # (o Pusher reenvia a mensagem com username do broadcaster, não do bot)
 _recent_bot_messages: deque[str] = deque(maxlen=30)
+# Últimas mensagens outbound para a landing (texto + timestamp)
+_recent_bot_outbound: deque[dict[str, Any]] = deque(maxlen=200)
 
 
 class ChannelSession(NamedTuple):
@@ -413,7 +425,8 @@ async def _safe_say(
 ) -> None:
     global _recent_bot_messages
     try:
-        fitted = _fit_chat_message(message)
+        expanded = await expand_leagueoflegends_macros(message)
+        fitted = _fit_chat_message(expanded)
         if not fitted:
             return
         target_bid = broadcaster_id if broadcaster_id is not None else primary_broadcaster_id
@@ -431,6 +444,7 @@ async def _safe_say(
             reply_to=reply_to,
             poster_type=chat_poster_type,
         )
+        _record_bot_outbound(fitted)
     except Exception:
         logger.exception("Failed to send chat message")
 
@@ -605,11 +619,15 @@ async def on_chat(event: Any) -> None:
     ):
         return
 
+    parts = msg.split()
+
     if chat_activity_store and chat_activity_cfg.get("enabled"):
         if _should_count_chat_activity_message(msg, prefix):
+            tier = classify_sender_tier(event.sender, _vip_badge_types_list())
             await chat_activity_store.record(
                 _resolve_chat_activity_channel_key(channel_bid),
                 username,
+                tier,
             )
 
     if await _handle_chat_activity_commands(
@@ -621,6 +639,71 @@ async def on_chat(event: Any) -> None:
         prefix=prefix,
     ):
         return
+
+    riot_rank_cfg = bot_cfg.get("riot_rank") or {}
+    if riot_rank_cfg.get("enabled", True) and parts:
+        riot_cmd = str(riot_rank_cfg.get("command") or "elo").strip().lower()
+        trigger_raw = (
+            os.getenv("RIOT_TRIGGER_MODE", "").strip().lower()
+            or str(riot_rank_cfg.get("trigger_mode") or "prefix").strip().lower()
+        )
+        trigger_mode = trigger_raw if trigger_raw in ("prefix", "word") else "prefix"
+
+        tokens: list[str] | None = None
+        if trigger_mode == "word":
+            wp_raw = (
+                os.getenv("RIOT_WORD_POSITION", "").strip().lower()
+                or str(riot_rank_cfg.get("word_position") or "start").strip().lower()
+            )
+            word_pos = wp_raw if wp_raw in ("start", "anywhere") else "start"
+            tokens = riot_tokens_after_command(
+                parts, riot_cmd, word_position=word_pos
+            )
+        elif msg.startswith(prefix) and parts[0][len(prefix) :].lower() == riot_cmd:
+            tokens = parts[1:]
+
+        if tokens is not None:
+            usage_cmd = riot_cmd if trigger_mode == "word" else f"{prefix}{riot_cmd}"
+            cooldown_seconds = float(riot_rank_cfg.get("cooldown_seconds", 20) or 0)
+            remaining = _remaining_cooldown("riot_rank", username, cooldown_seconds)
+            if remaining > 0:
+                await _safe_say(
+                    f"@{username} espera {int(remaining) + 1}s para usar {usage_cmd}.",
+                    reply_to=reply_to,
+                    broadcaster_id=channel_bid,
+                )
+                return
+            default_riot = (
+                os.getenv("RIOT_DEFAULT_RIOT", "").strip()
+                or str(riot_rank_cfg.get("default_riot") or "").strip()
+            )
+            default_platform = (
+                os.getenv("RIOT_DEFAULT_PLATFORM", "").strip()
+                or str(riot_rank_cfg.get("default_platform") or "").strip()
+            )
+            parsed = resolve_rank_query(
+                tokens,
+                default_riot=default_riot or None,
+                default_platform=default_platform or None,
+            )
+            if not parsed:
+                plat_hint = ", ".join(sorted(known_platforms())[:8])
+                await _safe_say(
+                    f"@{username} usa: {usage_cmd} ou {usage_cmd} NomeInvocador#TAG br1 "
+                    f"(plataformas: {plat_hint}, …). Opcional: default_riot + default_platform no config.",
+                    reply_to=reply_to,
+                    broadcaster_id=channel_bid,
+                )
+                return
+            _mark_command_used("riot_rank", username)
+            g, t, p = parsed
+            line = await fetch_solo_rank_line(g, t, p)
+            await _safe_say(
+                f"@{username} {line}",
+                reply_to=reply_to,
+                broadcaster_id=channel_bid,
+            )
+            return
 
     agent_enabled = agent_cfg.get("enabled", True)
     prompt = _extract_agent_prompt(msg) if agent_enabled else None
@@ -654,7 +737,6 @@ async def on_chat(event: Any) -> None:
         return
 
     if msg.startswith(prefix):
-        parts = msg.split()
         cmd = parts[0][len(prefix) :].lower()
         commands = bot_cfg.get("commands", {})
         command_def = commands.get(cmd)
@@ -723,6 +805,174 @@ def _existing_subscription_names(payload: dict[str, Any]) -> set[str]:
         if isinstance(name, str) and name:
             names.add(name)
     return names
+
+
+def _vip_badge_types_list() -> list[str]:
+    sw = chat_activity_cfg.get("sorteio_weighted") or {}
+    raw = sw.get("vip_badge_types")
+    if isinstance(raw, list) and raw:
+        return [str(x).strip() for x in raw if str(x).strip()]
+    return ["vip"]
+
+
+def _sorteio_mode() -> str:
+    m = str(chat_activity_cfg.get("sorteio_mode") or "weighted").strip().lower()
+    return m if m in ("weighted", "top_messages") else "weighted"
+
+
+def _weighted_multipliers() -> tuple[float, float, float]:
+    sw = chat_activity_cfg.get("sorteio_weighted") or {}
+    if not sw.get("enabled", True):
+        return (1.0, 1.0, 1.0)
+    md = float(sw.get("multiplier_default", 1))
+    ms = float(sw.get("multiplier_subscriber", 10))
+    mv = float(sw.get("multiplier_vip", 10))
+    return (md, ms, mv)
+
+
+def resolve_sorteio_scope_parts(parts: list[str]) -> tuple[bool, float]:
+    parsed = parse_window_seconds(parts)
+    default_session = bool(chat_activity_cfg.get("default_sorteio_use_session", True))
+    default_win = float(chat_activity_cfg.get("default_sorteio_window_seconds", 3600))
+    if parsed is not None:
+        return False, float(parsed)
+    return default_session, default_win
+
+
+def _winners_jsonl_path() -> Path:
+    raw = str(chat_activity_cfg.get("winners_log_path") or "data/sorteio_winners.jsonl").strip()
+    p = Path(raw)
+    return p if p.is_absolute() else PACKAGE_ROOT / p
+
+
+def append_sorteio_winner_record(payload: dict[str, Any]) -> None:
+    path = _winners_jsonl_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        logger.exception("Failed to append sorteio winner log")
+
+
+def _record_bot_outbound(text: str) -> None:
+    global _recent_bot_outbound
+    _recent_bot_outbound.append({"t": time.time(), "text": text[:2000]})
+
+
+async def execute_sorteio_draw(
+    channel_key: str,
+    parts: list[str],
+    *,
+    triggered_by: str | None,
+    source: str,
+) -> dict[str, Any]:
+    """Executa o sorteio (chat ou landing). `parts` inclui o token do comando, ex. ['!sorteio','15m']."""
+    store = chat_activity_store
+    if not store:
+        return {"ok": False, "error": "store_disabled", "message": ""}
+    use_session_only, window_sec = resolve_sorteio_scope_parts(parts)
+    sess_ts = chat_session_started_at
+    mode = _sorteio_mode()
+    md, ms, mv = _weighted_multipliers()
+    sw = chat_activity_cfg.get("sorteio_weighted") or {}
+    if not sw.get("enabled", True):
+        mode = "top_messages"
+
+    winner, counts, meta = store.pick_sorteio_winner(
+        channel_key,
+        window_sec,
+        session_start_ts=sess_ts,
+        use_session_only=use_session_only,
+        mode=mode,
+        multiplier_default=md,
+        multiplier_subscriber=ms,
+        multiplier_vip=mv,
+    )
+
+    if winner is None:
+        msg_out = "Ninguém na disputa (sem msgs no período)."
+    elif mode == "weighted":
+        mcount = int(meta.get("message_counts", {}).get(winner, counts.get(winner, 0)))
+        tk = float(meta.get("tickets", {}).get(winner, 0))
+        msg_out = f"Sorteio (ponderado): @{winner} — {mcount} msgs, {tk:.1f} bilhetes."
+    else:
+        wcount = counts.get(winner, 0)
+        best = max(counts.values())
+        n_tied = sum(1 for c in counts.values() if c == best)
+        tie_note = f" Empate no topo: {n_tied}." if n_tied > 1 else ""
+        msg_out = f"Sorteio: @{winner} — {wcount} msgs.{tie_note}"
+
+    append_sorteio_winner_record(
+        {
+            "ts": time.time(),
+            "channel_key": channel_key,
+            "winner": winner,
+            "mode": mode,
+            "triggered_by": triggered_by,
+            "source": source,
+            "scope": {"session_only": use_session_only, "window_seconds": window_sec},
+            "meta": {k: v for k, v in meta.items() if k != "tickets" or mode == "weighted"},
+            "counts": counts,
+        }
+    )
+
+    return {
+        "ok": True,
+        "winner": winner,
+        "message": msg_out,
+        "mode": mode,
+        "meta": meta,
+        "counts": counts,
+    }
+
+
+def execute_topchat_text(channel_key: str, parts: list[str]) -> str:
+    store = chat_activity_store
+    if not store:
+        return "Stats desligadas."
+    use_session_only, window_sec = resolve_sorteio_scope_parts(parts)
+    sess_ts = chat_session_started_at
+    counts = store.get_counts_for_scope(
+        channel_key,
+        window_sec,
+        session_start_ts=sess_ts,
+        use_session_only=use_session_only,
+    )
+    limit = int(chat_activity_cfg.get("topchat_limit", 5))
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[: max(1, limit)]
+    nu = len(counts)
+    if not ranked:
+        return "Top chat: ninguém no período."
+    bits = [f"{u}({c})" for u, c in ranked]
+    return f"Top: {' · '.join(bits)} | {nu} users."
+
+
+async def execute_clear_channel(channel_key: str) -> None:
+    if chat_activity_store:
+        await chat_activity_store.clear_channel(channel_key)
+
+
+def read_recent_winners(max_lines: int = 30) -> list[dict[str, Any]]:
+    path = _winners_jsonl_path()
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        logger.exception("read_recent_winners")
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines[-max_lines:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def _resolve_chat_activity_channel_key(channel_bid: int | None) -> str:
@@ -849,51 +1099,22 @@ async def _handle_chat_activity_commands(
         return True
     _mark_command_used(cooldown_key, username)
 
-    sess_ts = chat_session_started_at
-
-    parsed_window = parse_window_seconds(parts)
-    default_session = bool(chat_activity_cfg.get("default_sorteio_use_session", True))
-    default_win = float(chat_activity_cfg.get("default_sorteio_window_seconds", 3600))
-
-    if parsed_window is not None:
-        use_session_only = False
-        window_sec = float(parsed_window)
-    else:
-        use_session_only = default_session
-        window_sec = default_win
-
     if cmd == "sorteio":
-        winner, counts = chat_activity_store.pick_sorteio_winner(
+        result = await execute_sorteio_draw(
             ck,
-            window_sec,
-            session_start_ts=sess_ts,
-            use_session_only=use_session_only,
+            parts,
+            triggered_by=username,
+            source="chat",
         )
-        if winner is None:
-            out = "Ninguém na disputa (sem msgs no período)."
-        else:
-            wcount = counts.get(winner, 0)
-            best = max(counts.values())
-            n_tied = sum(1 for c in counts.values() if c == best)
-            tie_note = f" Empate no topo: {n_tied}." if n_tied > 1 else ""
-            out = f"Sorteio: @{winner} — {wcount} msgs.{tie_note}"
-        await _safe_say(_fit_chat_message(out), reply_to=reply_to, broadcaster_id=channel_bid)
+        msg_chat = result.get("message") or "Sorteio indisponível."
+        await _safe_say(
+            _fit_chat_message(msg_chat),
+            reply_to=reply_to,
+            broadcaster_id=channel_bid,
+        )
         return True
 
-    counts = chat_activity_store.get_counts_for_scope(
-        ck,
-        window_sec,
-        session_start_ts=sess_ts,
-        use_session_only=use_session_only,
-    )
-    limit = int(chat_activity_cfg.get("topchat_limit", 5))
-    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[: max(1, limit)]
-    nu = len(counts)
-    if not ranked:
-        out = "Top chat: ninguém no período."
-    else:
-        bits = [f"{u}({c})" for u, c in ranked]
-        out = f"Top: {' · '.join(bits)} | {nu} users."
+    out = execute_topchat_text(ck, parts)
     await _safe_say(_fit_chat_message(out), reply_to=reply_to, broadcaster_id=channel_bid)
     return True
 
@@ -1099,6 +1320,25 @@ if __name__ == "__main__":
         )
     asyncio.run(prepare_app())
     _install_pusher_timer_bootstrap()
+
+    landing_cfg = bot_cfg.get("landing") or {}
+    if landing_cfg.get("enabled", False):
+        land_host = str(landing_cfg.get("host", "127.0.0.1"))
+        land_port = int(landing_cfg.get("port", 8844))
+
+        def _run_landing() -> None:
+            import uvicorn
+            from landing_server import app as landing_app
+
+            uvicorn.run(landing_app, host=land_host, port=land_port, log_level="warning")
+
+        threading.Thread(target=_run_landing, daemon=True).start()
+        if not os.getenv("LANDING_API_SECRET", "").strip():
+            logger.warning(
+                "landing.enabled no config mas LANDING_API_SECRET vazio — POST /api/* na landing falhará."
+            )
+        logger.info("Landing UI em http://%s:%s/", land_host, land_port)
+
     if len(channel_slugs) > 1:
         run_multichannel_websocket(host=host, port=port)
     else:

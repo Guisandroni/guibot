@@ -10,6 +10,8 @@ Bot em Python para [Kick](https://kick.com), usando [KickForge](https://github.c
 
 ```bash
 pip install -r requirements.txt
+
+python bot.py
 ```
 
 Copia `.env.example` para `.env` e preenche credenciais e canal (`KICK_CHANNEL` ou lista em `kick.channels` no `config.yaml`).
@@ -126,8 +128,42 @@ Guarda eventos de mensagem por canal num ficheiro JSON (debounce, TTL e limite d
 | `topchat_limit` | Quantos lugares mostrar no ranking do `!topchat`. |
 | `clear_mods_only` | Se `true`, só mods/streamer podem `!clear`. |
 | `cooldown_clear` | Cooldown do `!clear`. |
+| `sorteio_mode` | `weighted` (bilhetes × multiplicador por tier) ou `top_messages` (entre quem mais digitou, empate aleatório). |
+| `sorteio_weighted` | Objeto: `enabled`, `multiplier_default`, `multiplier_subscriber`, `multiplier_vip`, `vip_badge_types` (lista — confirma o `type` real do badge VIP na Kick). |
+| `winners_log_path` | JSONL de ganhadores (por defeito `data/sorteio_winners.jsonl`). |
 
-O ficheiro em `data/` está ignorado no git (ver [.gitignore](.gitignore)).
+**`sorteio_weighted`:** com `enabled: true` e `sorteio_mode: weighted`, cada mensagem soma bilhetes conforme o tier na altura (badges do chat). VIP é detectado se o `type` do badge estiver em `vip_badge_types`.
+
+### Landing (`bot.landing`)
+
+Servidor FastAPI na mesma máquina que o bot (`enabled`, `host`, `port`; por defeito `127.0.0.1:8844`). Define **`LANDING_API_SECRET`** no `.env` para autorizar `POST /api/sorteio`, `/api/topchat`, `/api/clear` e **`GET /api/config`** (snapshot sanitizado do YAML). `GET /api/public` é público; **`GET /`** serve o painel SPA após compilares o front-end.
+
+**Painel (TanStack Start)** — código em [`web/`](web/):
+
+```bash
+cd web
+npm ci   # ou npm install
+npm run build
+```
+
+O build gera `web/.output/public/` (com `index.html` copiado do shell SPA). Sem esta pasta, `GET /` devolve 503 com instruções.
+
+Opcional: `web/.env` com `VITE_API_BASE=http://127.0.0.1:8844` para chamadas absolutas quando não usas proxy.
+
+Rotas do painel: `/` (acções + estado público), `/settings/key` (token + URL base no `localStorage`), `/settings/bot` (`GET /api/config`), `/docs`. O painel usa **TanStack Query** para `GET /api/public`, `GET /api/config` e invalidação após POST / ao gravar a chave.
+
+**Modos de execução**
+
+| Modo | Como |
+|------|------|
+| Produção-like | `npm run build` em `web/`, depois arranca o bot com `bot.landing` — mesmo host serve SPA em `/` e `/api/*`. |
+| Dev | Bot na porta da landing (ex. `8844`) + `cd web && npm run dev` na porta 3000; Vite faz proxy de `/api` → API (`VITE_DEV_API_PROXY` em [`vite.config.ts`](web/vite.config.ts)). |
+| Preview | API num porto + `cd web && npm run preview`; o preview também faz proxy de `/api` (igual ao `server.proxy`). |
+
+**Testes**
+
+- API (pytest), na raiz do pacote Python: `pytest tests/test_landing_api.py -v`
+- E2E (Playwright), em `web/`: `npx playwright install chromium` (primeira vez), depois `npm run test:e2e` — faz build do SPA, arranca `uvicorn landing_server:app` na porta **9888** com `LANDING_API_SECRET=testsecret`, e corre [`web/e2e/panel.spec.ts`](web/e2e/panel.spec.ts).
 
 ---
 
@@ -150,7 +186,7 @@ Mensagens com `hello` ou `selam` (case-insensitive) podem receber uma resposta d
 
 | Comando | Quem | O que faz |
 |---------|------|-----------|
-| `!sorteio` | Todos, ou só mods se `sorteio_mods_only: true` | Entre quem tem **mais mensagens** no período, escolhe **um vencedor ao acaso** (empate justo). Sem argumentos usa sessão ou janela conforme `default_sorteio_*`. |
+| `!sorteio` | Todos, ou só mods se `sorteio_mods_only: true` | Modo **weighted**: sorteio por bilhetes (sub/VIP com mais peso). Modo **top_messages**: entre quem mais digitou, empate aleatório. Sem argumentos: sessão ou janela conforme `default_sorteio_*`. |
 | `!sorteio <tempo>` | Idem | Janela móvel explícita (ver formatos abaixo). |
 | `!topchat` | Todos | Mostra um **ranking** curto e quantos utilizadores únicos há no mesmo período que o sorteio por defeito. |
 | `!topchat <tempo>` | Todos | Igual, com janela explícita. |
@@ -179,7 +215,10 @@ O bot pode responder a **novo follow**, **subscrição** e **kicks oferecidos** 
 |----------|--------|
 | `bot.py` | Entrada principal, eventos Kick, comandos, moderação, timers |
 | `agent.py` | Cliente LLM e prompts do assistente |
-| `chat_activity.py` | Persistência e contagens para sorteio/ranking |
+| `chat_activity.py` | Persistência, contagens, sorteio ponderado / top messages |
+| `kick_chat_identity.py` | Tier (sub/VIP) a partir do `sender` KickForge |
+| `landing_server.py` | API FastAPI + ficheiros estáticos do painel (`web/.output/public`) |
+| `web/` | SPA TanStack Start (painel: sorteio, config, docs) |
 | `config.yaml` | Configuração (credenciais sensíveis costumam estar só no `.env`) |
 | `scripts/kickforge_auth.py` | Ajuda a correr `kickforge auth` com `.env` carregado |
 

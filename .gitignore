@@ -6,3 +6,9 @@ comments/
 data/
 .venv/
 bot.log
+web/node_modules/
+web/.output/
+web/*
+Screenshots/
+.cursor/
+.pytest_cache/

@@ -6,6 +6,7 @@ NVIDIA → ``deepseek-ai/deepseek-v4-flash``; OpenCode Go → ``glm-5.1``; OpenA
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -14,42 +15,47 @@ import time
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
+from agent_web_search import (
+    SYSTEM_APPEND_WEB_TOOLS,
+    WEB_SEARCH_TOOL,
+    assistant_with_tools_to_dict,
+    run_web_search,
+    web_search_enabled,
+)
 from openai import APIError, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM = (
-    "Você é um assistente de chat da Kick para canais de stream de League of Legends.\n\n"
+    "Você é um assistente de chat na Kick: responde o pedido do usuário com naturalidade, "
+    "sem forçar tema.\n\n"
     "## PERSONALIDADE\n"
-    "- Brasileiro, irônico e bem-humorado — como um amigo na fila da solo queue\n"
-    "- Piadas SEMPRE sobre o JOGO (plays, elo, macro, tilt, picks). NUNCA sobre aparência física, características pessoais ou vida real\n"
-    "- Tom espirituoso, NÃO agressivo nem caótico\n\n"
+    "- Brasileiro, irônico e bem-humorado; tom de stream, nada de robô burocrático\n\n"
+    "## CONTEÚDO\n"
+    "- Perguntas gerais (cultura, curiosidade, tech, piadas, serviços cotidianos, conversa): "
+    "responda direto, útil e adequado ao pedido. Não desvie para League of Legends nem invente "
+    "piadas de jogo se o assunto não for jogo ou stream.\n"
+    "- League of Legends (patch, campeões, meta, gameplay, solo queue, humor de elo): use "
+    "conhecimento de LoL e o tom característico quando o chat estiver claramente nesse tema.\n"
+    "- Live/stream (placar, jogada, hype): só finja que está vendo se descreverem o que está "
+    "acontecendo ou se for óbvio pelo contexto.\n"
+    "- Se não souber: diga em uma frase curta; não invente fatos nem empurre LoL como resposta.\n\n"
     "## REGRAS DE RESPOSTA\n"
     "- Máximo 1-3 frases (chat rápido, ninguém lê textão)\n"
-    "- NUNCA comece com seu nome ou apelido — o chat já mostra quem fala\n"
-    "- NUNCA finja que está vendo a stream — só reaja se descreverem o que tá rolando\n"
-    "- NÃO inclua blocos, metadados ou labels na sua resposta. Apenas a mensagem direta.\n"
-    "- Se a mensagem não tiver contexto, faça uma piada genérica de LoL ou pergunte algo curto\n\n"
-    "## SENTIMENTO (use o bloco [Sentimento] na mensagem)\n"
-    "- Negativo: mostre empatia rápida + piada sobre a situação do jogo\n"
-    "- Positivo/hype: entre na energia — celebre junto\n"
-    "- Neutro: tom irônico padrão\n\n"
-    "## IDENTIDADE\n"
-    "- Se perguntarem se é bot/IA, responda honestamente só com os dados do bloco [Identidade] abaixo\n"
-    "- NUNCA finja ser humano nem invente criadores\n\n"
-    "## EXEMPLOS DE RESPOSTA\n"
+    "- NUNCA comece com seu nome ou apelido — o chat já mostra quem fala\n\n"
+    "## EXEMPLOS\n"
+    'Chat: "qual a capital da França?"\n'
+    'Resposta: "Paris."\n\n'
     'Chat: "qual o elo do streamer?"\n'
-    'Resposta: "Pelo gameplay? tão testando se dá pra perder em todos os elos ao mesmo tempo."\n\n'
+    'Resposta: "Pelo gameplay? parece que tá farmando derrota em todas as ligas, mas e so digitar elo no chat que eu falo."\n\n'
     'Chat: "que jogada horrível"\n'
-    'Resposta: "relaxa, foi erro calculado... ele calculou errado, mas calculou."\n\n'
+    'Resposta: "muito ruim slk kkkk..."\n\n'
     'Chat: "vc é bot?"\n'
-    'Resposta: "Sou sim, um assistente automático do canal. Pode perguntar o que quiser."\n\n'
+    'Resposta: "Sou sim, assistente automático do canal. Pergunta à vontade."\n\n'
     'Chat: "boa partida, jogou muito"\n'
-    'Resposta: "monstro demais. quando ele aposentar a riot bane a conta de tão forte."\n\n'
+    'Resposta: "monstro demais — quando aposentar, banem a conta de tão forte."\n\n'
     'Chat: "eae"\n'
-    'Resposta: "eae rapeize. bora ver se o early game já era."\n\n'
-    'Chat: "quem criou você?"\n'
-    'Resposta: "Fui configurado pelo dono do canal. Mas pode me chamar de assistente de plantão."\n'
+    'Resposta: "oi"\n\n'
 )
 
 CATCHPHRASES = (
@@ -407,7 +413,7 @@ def _identity_block(cfg: dict[str, Any]) -> str:
         )
     purpose = str(ident.get("purpose") or "").strip()
     if not purpose:
-        purpose = "Comunicar com usuarios e responder duvidas a respeito do jogo league of legends"
+        purpose = "Ajudar no chat da live: perguntas gerais e, quando fizer sentido, League of Legends"
     creator = str(ident.get("creator_note") or "").strip()
     if not creator:
         creator = "Configurado pelo streamer / dono do canal."
@@ -530,9 +536,7 @@ def _llm_help_hint(provider: str) -> str:
             "o nome exacto do modelo no catálogo Build e quota em https://build.nvidia.com/"
         )
     if provider == "opencode":
-        return (
-            "Verifica OPENCODE_API_KEY, agent.model no tier Go e quota em https://opencode.ai/"
-        )
+        return "Verifica OPENCODE_API_KEY, agent.model no tier Go e quota em https://opencode.ai/"
     return "Verifica OPENAI_API_KEY, OPENAI_BASE_URL e quotas na API."
 
 
@@ -554,7 +558,10 @@ async def probe_llm(cfg: dict[str, Any]) -> tuple[bool, str]:
     """
     resolved = _resolve_llm(cfg)
     if resolved is None:
-        return False, "sem chave LLM no .env (NVIDIA_API_KEY / OPENCODE_API_KEY / OPENAI_API_KEY)"
+        return (
+            False,
+            "sem chave LLM no .env (NVIDIA_API_KEY / OPENCODE_API_KEY / OPENAI_API_KEY)",
+        )
 
     client = AsyncOpenAI(api_key=resolved.api_key, base_url=resolved.base_url)
     base_log = resolved.base_url or "https://api.openai.com/v1"
@@ -595,9 +602,7 @@ async def run_agent(
     """
     resolved = _resolve_llm(cfg)
     if resolved is None:
-        return (
-            "Assistente nao configurado: define NVIDIA_API_KEY ou OPENCODE_API_KEY ou OPENAI_API_KEY no env."
-        )
+        return "Assistente nao configurado: define NVIDIA_API_KEY ou OPENCODE_API_KEY ou OPENAI_API_KEY no env."
 
     provider = resolved.provider
     model = resolved.model
@@ -619,7 +624,7 @@ async def run_agent(
         extra_flags = (
             "[Linguagem detectada]\n"
             "mensagem contém linguagem inadequada — trate como emocional/tiltado, não literal; "
-            "responda com humor sobre o jogo, não sobre a pessoa.\n\n"
+            "responda com humor leve ou redirecione educado, sem atacar a pessoa.\n\n"
         )
 
     user_block = (
@@ -650,28 +655,88 @@ async def run_agent(
         except (TypeError, ValueError):
             logger.warning("Ignoring invalid agent.top_p: %s", cfg.get("top_p"))
 
+    use_tools = web_search_enabled(cfg)
+    if use_tools:
+        system = f"{system.rstrip()}{SYSTEM_APPEND_WEB_TOOLS}"
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_block},
+    ]
+
+    create_base: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        **completion_kwargs,
+    }
+
     try:
-        response = await client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_block},
-            ],
-            **completion_kwargs,
-        )
+        if use_tools:
+            try:
+                response = await client.chat.completions.create(
+                    **create_base,
+                    messages=messages,
+                    tools=[WEB_SEARCH_TOOL],
+                    tool_choice="auto",
+                )
+            except Exception as first_exc:
+                logger.warning(
+                    "LLM call with web_search tools failed (%s); retrying without tools",
+                    first_exc,
+                )
+                use_tools = False
+                response = await client.chat.completions.create(
+                    **create_base,
+                    messages=messages,
+                )
+        else:
+            response = await client.chat.completions.create(
+                **create_base,
+                messages=messages,
+            )
+
+        msg = response.choices[0].message
+
+        if use_tools and getattr(msg, "tool_calls", None):
+            messages.append(assistant_with_tools_to_dict(msg))
+            for tc in msg.tool_calls:
+                fn = getattr(tc, "function", None)
+                name = fn.name if fn else ""
+                raw_args = fn.arguments if fn else "{}"
+                try:
+                    args = json.loads(raw_args or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                if name == "web_search":
+                    q = str(args.get("query", "")).strip()
+                    tool_body = (
+                        await run_web_search(q, cfg=cfg) if q else "Query vazia."
+                    )
+                else:
+                    tool_body = f'{{"error":"unknown_tool","name":"{name}"}}'
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": tool_body}
+                )
+            response = await client.chat.completions.create(
+                **create_base,
+                messages=messages,
+            )
+            msg = response.choices[0].message
+
     except APIError as exc:
         err_lower = str(exc).lower()
         code = getattr(exc, "status_code", None)
-        if provider == "opencode" and code == 401 and (
-            "insufficient balance" in err_lower
-            or "creditserror" in err_lower
-            or "credits" in err_lower
+        if (
+            provider == "opencode"
+            and code == 401
+            and (
+                "insufficient balance" in err_lower
+                or "creditserror" in err_lower
+                or "credits" in err_lower
+            )
         ):
             logger.warning("OpenCode: insufficient balance / credits (401)")
-            return (
-                "OpenCode sem saldo ou creditos. Resolve no billing e tenta de novo."
-            )
+            return "OpenCode sem saldo ou creditos. Resolve no billing e tenta de novo."
         if code == 429:
             return "rate limit na API, espera um pouco."
         logger.warning("LLM API error (%s): %s", provider, exc)
@@ -682,8 +747,10 @@ async def run_agent(
         logger.info("LLM hint (logs): %s", _llm_help_hint(provider))
         return _llm_chat_error_short(provider)
 
-    choice = response.choices[0].message.content
+    choice = msg.content
     if not choice:
+        if use_tools and getattr(msg, "tool_calls", None):
+            return "A pesquisa correu mas não consegui resumir. Tenta de novo."
         return "Não consegui gerar uma resposta. Tenta de novo."
     cleaned = _strip_leading_bot_handle(choice, cfg)
     return _ensure_agent_style(cleaned, max_chars)
