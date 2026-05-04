@@ -149,8 +149,9 @@ app = KickApp(
 )
 
 agent_cooldown = AgentCooldown(float(agent_cfg.get("cooldown_seconds", 20)))
-agent_trigger = str(agent_cfg.get("trigger") or "!ask").strip().lower()
+agent_trigger = str(agent_cfg.get("trigger") or agent_cfg.get("command") or "!ask").strip().lower()
 command_cooldowns: dict[tuple[str, str], float] = {}
+keyword_cooldowns: dict[str, float] = {}
 spam_history: dict[int, list[tuple[str, float]]] = {}
 timed_tasks: list[asyncio.Task[None]] = []
 timers_started = False
@@ -224,8 +225,18 @@ def _is_self_message(username: str) -> bool:
 
 def _extract_agent_prompt(message: str) -> str | None:
     lowered = message.lower().strip()
-    if lowered.startswith(agent_trigger):
-        return message[len(agent_trigger) :].strip()
+
+    # Trigger word anywhere in the message (start, middle, end)
+    if agent_trigger:
+        import re
+        pattern = re.compile(re.escape(agent_trigger), re.IGNORECASE)
+        match = pattern.search(message)
+        if match:
+            before = message[: match.start()].strip()
+            after = message[match.end() :].strip()
+            # Combine before + after, filtering out empty strings
+            parts = [p for p in (before, after) if p]
+            return " ".join(parts)
 
     if bot_username:
         mention_patterns = (
@@ -236,9 +247,9 @@ def _extract_agent_prompt(message: str) -> str | None:
             f"{bot_username}?",
             f"{bot_username}!",
         )
-        for pattern in mention_patterns:
-            if lowered.startswith(pattern):
-                return message[len(pattern) :].strip()
+        for pat in mention_patterns:
+            if lowered.startswith(pat):
+                return message[len(pat) :].strip()
         if lowered == bot_username:
             return ""
 
@@ -261,6 +272,17 @@ def _remaining_cooldown(command_name: str, username: str, seconds: float) -> flo
 
 def _mark_command_used(command_name: str, username: str) -> None:
     command_cooldowns[(command_name, username.lower())] = time.monotonic()
+
+
+def _remaining_keyword_cooldown(keyword: str, seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    remaining = seconds - (time.monotonic() - keyword_cooldowns.get(keyword, 0.0))
+    return max(0.0, remaining)
+
+
+def _mark_keyword_used(keyword: str) -> None:
+    keyword_cooldowns[keyword] = time.monotonic()
 
 
 def _contains_unapproved_link(message: str) -> bool:
@@ -647,23 +669,27 @@ async def on_chat(event: Any) -> None:
             os.getenv("RIOT_TRIGGER_MODE", "").strip().lower()
             or str(riot_rank_cfg.get("trigger_mode") or "prefix").strip().lower()
         )
-        trigger_mode = trigger_raw if trigger_raw in ("prefix", "word") else "prefix"
+        trigger_mode = trigger_raw if trigger_raw in ("prefix", "word", "both") else "prefix"
+
+        wp_raw = (
+            os.getenv("RIOT_WORD_POSITION", "").strip().lower()
+            or str(riot_rank_cfg.get("word_position") or "start").strip().lower()
+        )
+        word_pos = wp_raw if wp_raw in ("start", "anywhere") else "start"
 
         tokens: list[str] | None = None
-        if trigger_mode == "word":
-            wp_raw = (
-                os.getenv("RIOT_WORD_POSITION", "").strip().lower()
-                or str(riot_rank_cfg.get("word_position") or "start").strip().lower()
-            )
-            word_pos = wp_raw if wp_raw in ("start", "anywhere") else "start"
+        # Prefix trigger (!elo)
+        if trigger_mode in ("prefix", "both"):
+            if msg.startswith(prefix) and parts[0][len(prefix):].lower() == riot_cmd:
+                tokens = parts[1:]
+        # Word trigger (elo / elo em qualquer posição)
+        if tokens is None and trigger_mode in ("word", "both"):
             tokens = riot_tokens_after_command(
                 parts, riot_cmd, word_position=word_pos
             )
-        elif msg.startswith(prefix) and parts[0][len(prefix) :].lower() == riot_cmd:
-            tokens = parts[1:]
 
         if tokens is not None:
-            usage_cmd = riot_cmd if trigger_mode == "word" else f"{prefix}{riot_cmd}"
+            usage_cmd = f"{prefix}{riot_cmd}"
             cooldown_seconds = float(riot_rank_cfg.get("cooldown_seconds", 20) or 0)
             remaining = _remaining_cooldown("riot_rank", username, cooldown_seconds)
             if remaining > 0:
@@ -764,6 +790,21 @@ async def on_chat(event: Any) -> None:
             reply_to=reply_to,
             broadcaster_id=channel_bid,
         )
+        return
+
+    keyword_responses = bot_cfg.get("keyword_responses") or {}
+    msg_lower = msg.lower()
+    for keyword, kcfg in keyword_responses.items():
+        if keyword.lower() in msg_lower:
+            cooldown_seconds = float(kcfg.get("cooldown_seconds", 0) or 0)
+            if _remaining_keyword_cooldown(keyword, cooldown_seconds) <= 0:
+                _mark_keyword_used(keyword)
+                await _safe_say(
+                    str(kcfg.get("response") or ""),
+                    reply_to=None,
+                    broadcaster_id=channel_bid,
+                )
+            break
 
 
 @app.on("channel.followed")

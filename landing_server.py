@@ -86,15 +86,21 @@ def _commands_help_public() -> dict[str, str]:
     if isinstance(riot, dict) and riot.get("enabled", True):
         cmd = str(riot.get("command") or "elo").strip().lower()
         tm = str(riot.get("trigger_mode") or "prefix").strip().lower()
+        wp = str(riot.get("word_position") or "start").strip().lower()
+        anywhere_note = (
+            " Palavra comando em qualquer posição na frase."
+            if wp == "anywhere"
+            else ""
+        )
         if tm == "word":
-            wp = str(riot.get("word_position") or "start").strip().lower()
-            anywhere_note = (
-                " Palavra comando em qualquer posição na frase (word_position)."
-                if wp == "anywhere"
-                else ""
-            )
             lines["elo"] = (
                 f"Rank LoL: «{cmd}» ou «{cmd} Nome#TAG br1» — RIOT_API_KEY; "
+                "defaults default_riot/default_platform opcionais."
+                + anywhere_note
+            )
+        elif tm == "both":
+            lines["elo"] = (
+                f"Rank LoL: {prefix}{cmd} ou «{cmd}» (em qualquer posição) — RIOT_API_KEY; "
                 "defaults default_riot/default_platform opcionais."
                 + anywhere_note
             )

@@ -252,7 +252,7 @@ class ChatActivityStore:
         if use_session_only and session_start_ts is not None:
             return self._events_session(channel_key, session_start_ts)
         return self._events_for_window(
-            channel_key, window_seconds, session_start_ts=session_start_ts
+            channel_key, window_seconds, session_start_ts=session_start_ts if use_session_only else None
         )
 
     def counts_in_window(
@@ -296,7 +296,7 @@ class ChatActivityStore:
         return self.counts_in_window(
             channel_key,
             window_seconds,
-            session_start_ts=session_start_ts,
+            session_start_ts=session_start_ts if use_session_only else None,
         )
 
     def pick_sorteio_top_messages(

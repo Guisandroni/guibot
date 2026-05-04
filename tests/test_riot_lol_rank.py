@@ -119,3 +119,31 @@ def test_format_entry_master() -> None:
     )
     assert "Master" in s
     assert "42 LP" in s
+
+
+def _extract_tokens_both(msg: str, prefix: str, cmd: str, word_pos: str) -> list[str] | None:
+    """Simula a lógica do bot.py para trigger_mode='both'."""
+    parts = msg.split()
+    if not parts:
+        return None
+    # Prefix trigger
+    if msg.startswith(prefix) and parts[0][len(prefix):].lower() == cmd:
+        return parts[1:]
+    # Word trigger
+    return riot_tokens_after_command(parts, cmd, word_position=word_pos)
+
+
+@pytest.mark.parametrize(
+    ("msg", "expected"),
+    [
+        ("!elo Nick#TAG br1", ["Nick#TAG", "br1"]),
+        ("elo Nick#TAG br1", ["Nick#TAG", "br1"]),
+        ("qual elo ele ta?", ["ele", "ta?"]),
+        ("me mostra elo", []),
+        ("!elo", []),
+        ("elo", []),
+        ("random message", None),
+    ],
+)
+def test_both_trigger_mode(msg: str, expected: list[str] | None) -> None:
+    assert _extract_tokens_both(msg, prefix="!", cmd="elo", word_pos="anywhere") == expected
